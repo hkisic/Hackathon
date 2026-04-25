@@ -1,5 +1,6 @@
 import gpype as gp
 import time
+import winsound
 """
 Potentially useful methods
 gp.MovingAverage(window_size): power bands. power can fluctuate a lot, moving average helps smooth
@@ -16,18 +17,52 @@ gp.LSLSender(): to send to another program using lab streaming layer
 gp.FFT(): if we want the raw frequency spectrum (less black box)
 gp.Equation(expression): e.g. in1 / (in1 + in2) to calculate alpha/beta ration directly in pipeline
 """
-def calibrate(alpha_node, duration=10):
-    samples = []
+def record_phase(node_dict, duration):
+    #Helper for calibrate()
+    samples = {key: [] for key in node_dict.keys()}
     start_time = time.time()
 
     while time.time() - start_time < duration:
-        val = alpha_node.get_value()
-        if val > 0: #don't want 0s in startup
-            samples.append(val)
-        time.sleep(0.1) #CPU catchup
+        for key, node in node_dict.items():
+            val = node.get_value()
+            if val > 0:
+                samples[key].append(val)
+        time.sleep(0.1) #10Hz sampling
 
-    baseline = sum(samples) / len(samples) if samples else 1.0
-    return baseline
+    return {key: (sum(s) / len(s) if s else 0) for key, s in samples.items()}
+
+def calibrate(abt_node_dict, duration=15): #returns a calibration dict
+    print("\n--- PHASE 1: EYES CLOSED ---")
+    input ("Press Enter, then CLOSE YOUR EYES immediately.")
+
+    #Record Eyes Closed
+    eyes_closed_avgs = record_phase(abt_node_dict, duration)
+    #beep!
+    winsound.Beep(1000, 500)
+    print("DONE. You can open your eyes.")
+
+    print("\n--- PHASE 2: MENTAL MATH (Beta-Theta Max / Alpha Min) ---")
+    print("Task: Count backwards from 1000 by 7s in your head.")
+    input("Press Enter to start.")
+
+    #Record Mental Math
+    math_avgs = record_phase(abt_node_dict, duration)
+    winsound.Beep(1000, 500)
+    print("CALIBRATION COMPLETE.\n")
+
+    """
+    Mapping logic swap
+    Alpha: max = eyes closed; min = math
+    Beta/Theta: max = math; min = eyes closed
+    """
+
+    abt_minmax_dict = {
+        'alpha': {'min': math_avgs['alpha'], 'max': eyes_closed_avgs['alpha']},
+        'beta': {'min': eyes_closed_avgs['beta'], 'max': math_avgs['beta']},
+        'theta': {'min': eyes_closed_avgs['theta'], 'max': math_avgs['theta']}
+    }
+
+    return abt_minmax_dict
 
 def main():
     #Initialize
@@ -72,24 +107,35 @@ def main():
     #Start stream
     pipeline.start()
 
-    alpha_baseline = calibrate(alpha_smooth, duration = 10)
+    abt_nodes = {
+        'alpha': alpha_smooth,
+        'beta': beta_smooth,
+        'theta': theta_smooth
+    }
+
+    #Run calibration
+    limits = calibrate(abt_nodes, duration=15)
     
     try:
-        print(f"{'Theta':^10} | {'Alpha':^10} | {'Beta':^10}")
-        print("-" * 36)
-
         while True:
-            #pull latest values from nodes
-            t_val = theta_power.get_value()
-            a_val = alpha_power.get_value()
-            b_val = beta_power.get_value()
+            #get current smoothed values
+            cur = {key: node.get_value() for key, node in abt_nodes.items()}
 
-            a_rel = a_val / alpha_baseline
-            
+            #scale scores
+            scores = {}
+            for band in ['alpha', 'beta', 'theta']:
+                mn = limits[band]['min']
+                mx = limits[band]['max']
+                #normalization formula: (current - min) / (max - min)
+                #use max(0, min(1, ...)) to stay in 0-1 range
+                raw_score = (cur[band] - mn) / (mx - mn) if (mx - mn) != 0 else 0
+                scores[band] = max(0, min(1, raw_score))
 
-            print(f"{t_val*100:10.2f} | {a_val*100:10.2f} | {b_val*100:10.2f}", end='\r')
-
-            time.sleep(0.1)
+            #output
+            print(f"Alpha (Relax): {scores['alpha']*100:.0f}% | "
+                  f"Beta (Arousal): {scores['beta']*100:.0f}% | "
+                  f"Theta (Effort): {scores['theta']*100:.0f}%", end='\r')
+            time.sleep(0.5)
 
     except KeyboardInterrupt:
         pipeline.stop()
