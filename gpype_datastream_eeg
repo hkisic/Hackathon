@@ -1,0 +1,174 @@
+import gpype as gp
+import time
+import winsound
+"""
+Potentially useful methods
+gp.MovingAverage(window_size): power bands. power can fluctuate a lot, moving average helps smooth
+gp.Decimator(decimation_factor): reduce sampling rate (to less than 250Hz), saves CPU
+gp.Hold(): keeps last valid sample in buffer to avoid 'None'
+
+gp.Router(input_channels): select specific channels
+gp.Router.ALL to pass all channels
+gp.Framer(frame_size): groups samples into chunks ('frames'), saves CPU
+gp.TimeSeriesScope(): real time graph, can add markers to it
+gp.CsvWriter(file_name): if we want to write data
+gp.LSLSender(): to send to another program using lab streaming layer
+
+gp.FFT(): if we want the raw frequency spectrum (less black box)
+gp.Equation(expression): e.g. in1 / (in1 + in2) to calculate alpha/beta ration directly in pipeline
+"""
+def record_phase(node_dict, duration):
+    #Helper for calibrate()
+    samples = {key: [] for key in node_dict.keys()}
+    start_time = time.time()
+
+    while time.time() - start_time < duration:
+        for key, node in node_dict.items():
+            val = node.get_value()
+            if val > 0:
+                samples[key].append(val)
+        time.sleep(0.1) #10Hz sampling
+
+    return {key: (sum(s) / len(s) if s else 0) for key, s in samples.items()}
+
+def calibrate(abt_node_dict, duration=15): #returns a calibration dict
+    print("\n--- PHASE 1: EYES CLOSED ---")
+    input ("Press Enter, then CLOSE YOUR EYES immediately.")
+
+    #Record Eyes Closed
+    eyes_closed_avgs = record_phase(abt_node_dict, duration)
+    #beep!
+    winsound.Beep(1000, 500)
+    print("DONE. You can open your eyes.")
+
+    print("\n--- PHASE 2: MENTAL MATH (Beta-Theta Max / Alpha Min) ---")
+    print("Task: Count backwards from 1000 by 7s in your head.")
+    input("Press Enter to start.")
+
+    #Record Mental Math
+    math_avgs = record_phase(abt_node_dict, duration)
+    winsound.Beep(1000, 500)
+    print("CALIBRATION COMPLETE.\n")
+
+    """
+    Mapping logic swap
+    Alpha: max = eyes closed; min = math
+    Beta/Theta: max = math; min = eyes closed
+    """
+
+    abt_minmax_dict = {
+        'alpha': {'min': math_avgs['alpha'], 'max': eyes_closed_avgs['alpha']},
+        'beta': {'min': eyes_closed_avgs['beta'], 'max': math_avgs['beta']},
+        'theta': {'min': eyes_closed_avgs['theta'], 'max': math_avgs['theta']}
+    }
+
+    return abt_minmax_dict
+
+def compute_eeg_biomarkers(scores):
+    eeg_arousal = scores["beta"]
+    eeg_valence = scores["alpha"] - scores["theta"]
+    eeg_cognitive_load = scores["theta"]
+
+    eeg_valence = max(-1.0, min(1.0, eeg_valence))
+
+    return {
+        "arousal": eeg_arousal,
+        "valence": eeg_valence,
+        "cognitive_load": eeg_cognitive_load
+    }
+
+def main():
+    #Initialize
+    app = gp.MainApp()
+    pipeline = gp.Pipeline()
+
+    #Connect to Unicorn Headset
+    source = gp.UnicornSource(device_id=0)
+    pipeline.add_node(source)
+
+    #Pre-process
+    bandpass = gp.BandpassFilter(f_low=1.0, f_high=50.0, order =4)
+    notch = gp.NotchFilter(f_center=50.0, bandwidth=2.0)
+
+    pipeline.add_node(bandpass, input_node = source)
+    pipeline.add_node(notch, input_node=bandpass)
+
+    frontal_node = gp.Router(input_channels=[0]) #Fz
+    occipital_node = gp.Router(input_channels=[6]) #Oz
+
+    pipeline.add_node(frontal_node, input_node=notch)
+    pipeline.add_node(occipital_node, input_node=notch)
+
+    #Power band extraction
+    theta_power = gp.ThetaPower(smoothing=0.5) #4-8Hz
+    alpha_power = gp.AlphaPower(smoothing=0.5) #8-13Hz
+    beta_power = gp.BetaPower(smoothing=0.5) #13-30Hz
+
+    pipeline.add_node(theta_power, input_node=frontal_node)
+    pipeline.add_node(alpha_power, input_node=occipital_node)
+    pipeline.add_node(beta_power, input_node=source)
+
+    #Moving averages
+    theta_smooth = gp.MovingAverage(window_size=250) #1 sec avg
+    pipeline.add_node(theta_smooth, input_node=theta_power)
+
+    alpha_smooth = gp.MovingAverage(window_size=250) #1 sec avg
+    pipeline.add_node(alpha_smooth, input_node=alpha_power)
+
+    beta_smooth = gp.MovingAverage(window_size=250) #1 sec avg
+    pipeline.add_node(beta_smooth, input_node=beta_power)
+    #Start stream
+    pipeline.start()
+
+    abt_nodes = {
+        'alpha': alpha_smooth,
+        'beta': beta_smooth,
+        'theta': theta_smooth
+    }
+
+    #Run calibration
+    limits = calibrate(abt_nodes, duration=15)
+    
+    try:
+        while True:
+            #get current smoothed values
+            cur = {key: node.get_value() or 0 for key, node in abt_nodes.items()}
+
+            #scale scores
+            scores = {}
+            for band in ['alpha', 'beta', 'theta']:
+                mn = limits[band]['min']
+                mx = limits[band]['max']
+                #normalization formula: (current - min) / (max - min)
+                #use max(0, min(1, ...)) to stay in 0-1 range
+                raw_score = (cur[band] - mn) / (mx - mn) if (mx - mn) != 0 else 0
+                scores[band] = max(0, min(1, raw_score))
+
+            biomarkers = compute_eeg_biomarkers(scores)
+
+            eeg_arousal = biomarkers["arousal"]
+            eeg_valence = biomarkers["valence"]
+            eeg_cognitive_load = biomarkers["cognitive_load"]
+
+            i1_msg = {
+                "type": "biomarker_tick",
+                "source": "I1",
+                "ts_py": time.time(),
+                "payload": {
+                "arousal": eeg_arousal,
+                "valence": eeg_valence,
+                "cognitive_load": eeg_cognitive_load,
+                "signal_quality": "ok",
+                "baseline_ready": True,
+            }
+        }    
+            print(i1_msg)
+            time.sleep(0.5)
+       
+
+    except KeyboardInterrupt:
+        pipeline.stop()
+
+
+if __name__ == "__main__":
+    main()
